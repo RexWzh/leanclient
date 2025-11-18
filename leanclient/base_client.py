@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 import orjson
 
-from .utils import SemanticTokenProcessor, has_mathlib_dependency
+from .utils import SemanticTokenProcessor, has_mathlib_dependency, get_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ class BaseLeanLSPClient:
             subprocess.run(
                 ["lake", "exe", "cache", "get"],
                 cwd=self.project_path,
+                env=get_env_vars(),
                 check=False,
                 stderr=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -54,6 +55,7 @@ class BaseLeanLSPClient:
         self.process = subprocess.Popen(
             ["lake", "serve"],
             cwd=self.project_path,
+            env=get_env_vars(),
             stdout=subprocess.PIPE,
             stdin=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -373,7 +375,11 @@ class BaseLeanLSPClient:
             dict | str: Environment variables.
         """
         response = subprocess.run(
-            ["lake", "env"], cwd=self.project_path, capture_output=True, text=True
+            ["lake", "env"],
+            cwd=self.project_path,
+            env=get_env_vars(),
+            capture_output=True,
+            text=True,
         )
         if not return_dict:
             return response.stdout

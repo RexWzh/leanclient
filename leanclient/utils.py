@@ -1,4 +1,5 @@
 # Varia to be sorted later...
+import os
 from dataclasses import dataclass
 from functools import wraps
 from typing import Tuple
@@ -260,3 +261,14 @@ def experimental(func):
     doc_lines.insert(1, warning)
     wrapper.__doc__ = "\n".join(doc_lines)
     return wrapper
+
+def get_env_vars():
+    """Get environment variables."""
+    env = os.environ.copy()
+    elan_home = os.getenv('ELAN_HOME', os.path.expanduser('~/.elan/home'))
+    elan_bin = f"{elan_home}/bin"
+    if 'PATH' in env:
+        env['PATH'] = env['PATH'] + os.pathsep + elan_bin
+    else:
+        env['PATH'] = elan_bin
+    return env
