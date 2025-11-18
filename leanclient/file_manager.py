@@ -831,6 +831,285 @@ class LSPFileManager(BaseLeanLSPClient):
             with self._close_condition:
                 self._close_condition.wait(timeout=0.01)
 
+    def create_new_file(
+        self,
+        path: str,
+        content: str = "",
+        dependency_build_mode: str = "never",
+        write_to_disk: bool = True,
+    ) -> None:
+        """Create and open a new file in the language server.
+
+        Args:
+            path (str): Relative file path to create.
+            content (str): Initial content for the new file. Defaults to empty string.
+            dependency_build_mode (str): Whether to automatically rebuild dependencies. Defaults to "never".
+            write_to_disk (bool): Whether to write the file to disk. Defaults to True.
+
+        Raises:
+            FileExistsError: If file already exists on disk and write_to_disk is True.
+            RuntimeError: If maximum opened files limit would be exceeded.
+        """
+        import os
+        from .utils import normalize_newlines
+
+        # Check if we would exceed max files limit
+        if len(self.opened_files) >= self.max_opened_files:
+            raise RuntimeError(
+                f"Cannot create new file: would exceed maximum of {self.max_opened_files} opened files. Close some files first."
+            )
+
+        # Normalize content
+        content = normalize_newlines(content)
+        
+        # Convert to absolute path for disk operations
+        abs_path = self._uri_to_abs(self._local_to_uri(path))
+        
+        if write_to_disk:
+            # Check if file already exists on disk
+            if os.path.exists(abs_path):
+                raise FileExistsError(f"File {path} already exists on disk.")
+            
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            
+            # Write file to disk
+            with open(abs_path, 'w') as f:
+                f.write(content)
+
+        # Open the file in LSP server
+        uri = self._local_to_uri(path)
+        
+        # Initialize file state
+        with self._opened_files_lock:
+            self._recently_closed.discard(path)
+            self.opened_files[path] = FileState(uri=uri, content=content)
+
+        # Send textDocument/didOpen notification
+        params = {
+            "textDocument": {
+                "uri": uri,
+                "text": content,
+                "languageId": "lean",
+                "version": 0,
+            },
+            "dependencyBuildMode": dependency_build_mode,
+        }
+        self._send_notification("textDocument/didOpen", params)
+
+    def get_execution_result(
+        self,
+        path: str,
+        line: int | None = None,
+        character: int | None = None,
+        inactivity_timeout: float = 15.0,
+    ) -> dict:
+        """Get execution result for a file or specific position.
+
+        Args:
+            path (str): Relative file path.
+            line (int | None): Line number (0-based). If None, gets result for entire file.
+            character (int | None): Character position (0-based). Required if line is provided.
+            inactivity_timeout (float): Maximum time to wait for result. Defaults to 15 seconds.
+
+        Returns:
+            dict: Execution result from language server.
+
+        Raises:
+            FileNotFoundError: If file is not open.
+            ValueError: If line is provided but character is not.
+        """
+        if line is not None and character is None:
+            raise ValueError("character position is required when line is provided")
+
+        # Ensure file is open
+        if path not in self.opened_files:
+            self.open_file(path)
+
+        # Wait for file to be ready
+        self.get_diagnostics(path, inactivity_timeout=inactivity_timeout)
+
+        # Prepare request parameters
+        params = {}
+        if line is not None and character is not None:
+            params["position"] = {"line": line, "character": character}
+
+        # Send request for execution result
+        try:
+            result = self._send_request(path, "textDocument/hover", params)
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def close_file_with_save_option(
+        self,
+        path: str,
+        save_to_disk: bool = False,
+        blocking: bool = True,
+    ) -> None:
+        """Close a file with option to save changes to disk.
+
+        Args:
+            path (str): Relative file path to close.
+            save_to_disk (bool): If True, save current LSP content to disk before closing. Defaults to False.
+            blocking (bool): If True, wait for diagnostics flush. Defaults to True.
+
+        Raises:
+            FileNotFoundError: If file is not open.
+        """
+        if path not in self.opened_files:
+            raise FileNotFoundError(f"File {path} is not open. Call open_file first.")
+
+        if save_to_disk:
+            # Get current content from LSP server
+            content = self.get_file_content(path)
+            
+            # Write to disk
+            abs_path = self._uri_to_abs(self._local_to_uri(path))
+            with open(abs_path, 'w') as f:
+                f.write(content)
+
+        # Use existing close_files method
+        self.close_files([path], blocking=blocking)
+
+    def close_files_with_save_option(
+        self,
+        paths: list[str],
+        save_to_disk: bool = False,
+        blocking: bool = True,
+    ) -> None:
+        """Close multiple files with option to save changes to disk.
+
+        Args:
+            paths (list[str]): List of relative file paths to close.
+            save_to_disk (bool): If True, save current LSP content to disk before closing. Defaults to False.
+            blocking (bool): If True, wait for diagnostics flush. Defaults to True.
+
+        Raises:
+            FileNotFoundError: If any file is not open.
+        """
+        # Check all files exist first
+        missing = [p for p in paths if p not in self.opened_files]
+        if missing:
+            raise FileNotFoundError(f"Files {missing} are not open. Call open_files first.")
+
+        if save_to_disk:
+            # Save all files to disk first
+            for path in paths:
+                content = self.get_file_content(path)
+                abs_path = self._uri_to_abs(self._local_to_uri(path))
+                with open(abs_path, 'w') as f:
+                    f.write(content)
+
+        # Use existing close_files method
+        self.close_files(paths, blocking=blocking)
+
+    def check_workspace_consistency(self) -> dict[str, dict]:
+        """Check consistency between LSP workspace and disk workspace.
+
+        Returns:
+            dict: Dictionary mapping file paths to their consistency status.
+                  Each status dict contains:
+                  - 'consistent': bool indicating if LSP and disk content match
+                  - 'lsp_content': str content as seen by LSP server
+                  - 'disk_content': str content on disk
+                  - 'error': str error message if file couldn't be read from disk
+
+        Example:
+            {
+                'example.lean': {
+                    'consistent': False,
+                    'lsp_content': 'def hello := "world"',
+                    'disk_content': 'def hello := "universe"',
+                },
+                'missing.lean': {
+                    'consistent': False,
+                    'lsp_content': 'def test := 1',
+                    'disk_content': None,
+                    'error': 'File not found on disk'
+                }
+            }
+        """
+        consistency_report = {}
+        
+        with self._opened_files_lock:
+            opened_paths = list(self.opened_files.keys())
+
+        for path in opened_paths:
+            # Get LSP content
+            lsp_content = self.get_file_content(path)
+            
+            # Try to read disk content
+            try:
+                abs_path = self._uri_to_abs(self._local_to_uri(path))
+                with open(abs_path, 'r') as f:
+                    disk_content = f.read()
+                
+                # Normalize both for comparison
+                from .utils import normalize_newlines
+                lsp_normalized = normalize_newlines(lsp_content)
+                disk_normalized = normalize_newlines(disk_content)
+                
+                consistency_report[path] = {
+                    'consistent': lsp_normalized == disk_normalized,
+                    'lsp_content': lsp_content,
+                    'disk_content': disk_content,
+                }
+                
+            except Exception as e:
+                consistency_report[path] = {
+                    'consistent': False,
+                    'lsp_content': lsp_content,
+                    'disk_content': None,
+                    'error': str(e)
+                }
+
+        return consistency_report
+
+    def sync_workspace_from_disk(self, paths: list[str] | None = None) -> dict[str, bool]:
+        """Reset LSP workspace to match disk workspace for specified files.
+
+        Args:
+            paths (list[str] | None): List of relative file paths to sync. 
+                                    If None, syncs all currently opened files.
+
+        Returns:
+            dict: Dictionary mapping file paths to success status (True/False).
+
+        Example:
+            {
+                'example.lean': True,
+                'missing.lean': False  # Failed to sync due to disk read error
+            }
+        """
+        if paths is None:
+            with self._opened_files_lock:
+                paths = list(self.opened_files.keys())
+
+        sync_results = {}
+        
+        for path in paths:
+            try:
+                # Check if file is open
+                if path not in self.opened_files:
+                    sync_results[path] = False
+                    continue
+
+                # Read content from disk
+                abs_path = self._uri_to_abs(self._local_to_uri(path))
+                with open(abs_path, 'r') as f:
+                    disk_content = f.read()
+                
+                # Update LSP server with disk content
+                self.update_file_content(path, disk_content)
+                sync_results[path] = True
+                
+            except Exception as e:
+                logger.warning(f"Failed to sync {path} from disk: {e}")
+                sync_results[path] = False
+
+        return sync_results
+
     def _wait_for_line_range(
         self,
         uris: list[str],
