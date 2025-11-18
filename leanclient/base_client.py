@@ -5,6 +5,7 @@ import threading
 import asyncio
 import logging
 import atexit
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -36,7 +37,6 @@ class BaseLeanLSPClient:
         prevent_cache_get: bool = False,
     ):
         self.project_path = Path(project_path).resolve()
-        self.request_id = 0  # Counter for generating unique request IDs
 
         if initial_build:
             self.build_project(get_cache=not prevent_cache_get)
@@ -280,24 +280,21 @@ class BaseLeanLSPClient:
         Returns:
             int | None: Id of the request if it is not a notification.
         """
-        if not is_notification:
-            request_id = self.request_id
-            self.request_id += 1
-
         request = {
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
-            **({"id": request_id} if not is_notification else {}),
         }
+        if not is_notification:
+            request_id = str(uuid.uuid4())
+            request["id"] = request_id
 
         body = orjson.dumps(request)
         header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
         self.stdin.write(header + body)
         self.stdin.flush()
 
-        if not is_notification:
-            return request_id
+        return request_id
 
     def _send_notification(self, method: str, params: dict):
         """Send a notification to the language server.
